@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { getEstimatedBitrateKbps, getExportDimensions } from '@/lib/editor/timelineMath';
 import type { ExportSettings } from '@/lib/editor/types';
+import { resolveFfmpegBinary } from '@/lib/server/ffmpegCheck';
 
 export const runtime = 'nodejs';
 export const maxDuration = 180;
@@ -24,6 +25,18 @@ const VIDEO_MIME: Record<string, string> = {
 export async function POST(req: NextRequest) {
   let workDir = '';
   try {
+    const ffmpegBin = await resolveFfmpegBinary();
+    if (!ffmpegBin) {
+      return NextResponse.json(
+        {
+          error: 'محرك الخادم غير متاح في بيئة الاستضافة الحالية؛ يتم التصدير مباشرة عبر المتصفح.',
+          code: 'FFMPEG_UNAVAILABLE',
+          fallbackToClient: true,
+        },
+        { status: 501 }
+      );
+    }
+
     const formData = await req.formData();
     const videoFile = formData.get('video');
     const audioFile = formData.get('audio');
@@ -72,7 +85,6 @@ export async function POST(req: NextRequest) {
         outputPath
       );
     } else {
-      // Scale smoothly to target resolution (up to 4K 3840x2160) with exact aspect
       args.push('-vf', `scale=${width}:${height}:flags=lanczos,fps=${fps}`);
 
       if (audioPath) {
@@ -81,7 +93,6 @@ export async function POST(req: NextRequest) {
         args.push('-map', '0:v:0', '-an');
       }
 
-      // Select codec compatible with container
       if (outExt === 'webm' || codec === 'vp9') {
         if (outExt === 'webm') {
           args.push('-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '6', '-b:v', `${bitrateKbps}k`);
@@ -113,7 +124,7 @@ export async function POST(req: NextRequest) {
       args.push(outputPath);
     }
 
-    await execFileAsync('ffmpeg', args);
+    await execFileAsync(ffmpegBin, args);
     const outBuffer = await readFile(outputPath);
 
     return new NextResponse(new Uint8Array(outBuffer), {
@@ -125,8 +136,21 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'تعذر تصدير الفيديو';
-    return NextResponse.json({ error: message }, { status: 500 });
+    const rawMsg = err instanceof Error ? err.message : '';
+    if (rawMsg.includes('ENOENT')) {
+      return NextResponse.json(
+        {
+          error: 'محرك الخادم غير متاح؛ يتم التصدير مباشرة عبر المتصفح.',
+          code: 'FFMPEG_UNAVAILABLE',
+          fallbackToClient: true,
+        },
+        { status: 501 }
+      );
+    }
+    return NextResponse.json(
+      { error: rawMsg || 'تعذر تصدير الفيديو' },
+      { status: 500 }
+    );
   } finally {
     if (workDir) {
       await rm(workDir, { recursive: true, force: true }).catch(() => {});

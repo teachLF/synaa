@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { resolveFfmpegBinary, resolveFfprobeBinary } from '@/lib/server/ffmpegCheck';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
@@ -19,9 +20,12 @@ interface ProbeResult {
   codecName: string;
 }
 
-async function probeMedia(filePath: string): Promise<ProbeResult> {
+async function probeMedia(ffprobeBin: string | null, filePath: string): Promise<ProbeResult> {
+  if (!ffprobeBin) {
+    return { duration: 5, width: 1920, height: 1080, hasVideo: true, hasAudio: false, codecName: 'unknown' };
+  }
   try {
-    const { stdout } = await execFileAsync('ffprobe', [
+    const { stdout } = await execFileAsync(ffprobeBin, [
       '-v',
       'quiet',
       '-print_format',
@@ -61,6 +65,18 @@ async function probeMedia(filePath: string): Promise<ProbeResult> {
 export async function POST(req: NextRequest) {
   let workDir = '';
   try {
+    const ffmpegBin = await resolveFfmpegBinary();
+    if (!ffmpegBin) {
+      return NextResponse.json(
+        {
+          error: 'تحويل الصيغ غير المدعومة على الخادم غير متاح في الاستضافة السحابية الحالية.',
+          code: 'FFMPEG_UNAVAILABLE',
+        },
+        { status: 501 }
+      );
+    }
+    const ffprobeBin = await resolveFfprobeBinary();
+
     const formData = await req.formData();
     const file = formData.get('file');
     const kind = String(formData.get('kind') || 'video');
@@ -75,7 +91,7 @@ export async function POST(req: NextRequest) {
     const arrayBuffer = await file.arrayBuffer();
     await writeFile(inputPath, Buffer.from(arrayBuffer));
 
-    const probe = await probeMedia(inputPath);
+    const probe = await probeMedia(ffprobeBin, inputPath);
 
     let outputPath = '';
     let outputMime = '';
@@ -83,11 +99,11 @@ export async function POST(req: NextRequest) {
     if (kind === 'image') {
       outputPath = path.join(workDir, 'proxy.png');
       outputMime = 'image/png';
-      await execFileAsync('ffmpeg', ['-y', '-i', inputPath, '-frames:v', '1', outputPath]);
+      await execFileAsync(ffmpegBin, ['-y', '-i', inputPath, '-frames:v', '1', outputPath]);
     } else if (kind === 'audio') {
       outputPath = path.join(workDir, 'proxy.mp3');
       outputMime = 'audio/mpeg';
-      await execFileAsync('ffmpeg', [
+      await execFileAsync(ffmpegBin, [
         '-y',
         '-i',
         inputPath,
@@ -122,7 +138,7 @@ export async function POST(req: NextRequest) {
         args.push('-an');
       }
       args.push('-movflags', '+faststart', outputPath);
-      await execFileAsync('ffmpeg', args);
+      await execFileAsync(ffmpegBin, args);
     }
 
     const outBuffer = await readFile(outputPath);
@@ -137,8 +153,14 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'فشلت عملية تحويل الصيغة';
-    return NextResponse.json({ error: message }, { status: 500 });
+    const rawMsg = err instanceof Error ? err.message : '';
+    if (rawMsg.includes('ENOENT')) {
+      return NextResponse.json(
+        { error: 'محرك تحويل الصيغ على الخادم غير متوفر', code: 'FFMPEG_UNAVAILABLE' },
+        { status: 501 }
+      );
+    }
+    return NextResponse.json({ error: rawMsg || 'فشلت عملية تحويل الصيغة' }, { status: 500 });
   } finally {
     if (workDir) {
       await rm(workDir, { recursive: true, force: true }).catch(() => {});

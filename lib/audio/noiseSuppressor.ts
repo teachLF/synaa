@@ -56,17 +56,17 @@ export function applyAudioCleanupToGraph(
 }
 
 /**
- * Mixes all active audio clips (from audio tracks and unmuted video clips) via OfflineAudioContext,
- * applying full noise-removal DSP filters, fades, and normalization, and returns a clean WAV Uint8Array.
+ * Mixes all active audio clips via OfflineAudioContext with full noise-removal DSP
+ * and returns stereo Float32Array channels + sampleRate.
  */
-export async function renderProjectMixdownWav(
+export async function renderProjectMixdownChannels(
   clips: TimelineClip[],
   tracks: TimelineTrack[],
   assets: Map<string, MediaAsset>,
   totalDuration: number,
   sampleRate = 48000,
   forceDenoiseAll = false
-): Promise<Uint8Array> {
+): Promise<{ channels: [Float32Array, Float32Array]; sampleRate: number }> {
   const safeDuration = Math.max(0.5, totalDuration);
   const length = Math.ceil(safeDuration * sampleRate);
   const offline = new OfflineAudioContext(2, length, sampleRate);
@@ -120,7 +120,6 @@ export async function renderProjectMixdownWav(
         false
       );
 
-      // Apply fade-in / fade-out automation
       const start = Math.max(0, clip.startTime);
       const end = start + clip.duration;
       const baseVol = effectiveAudio.volume;
@@ -146,12 +145,34 @@ export async function renderProjectMixdownWav(
 
       source.start(start, clip.trimStart, clip.duration * (clip.speed || 1));
     } catch {
-      // Skip clips whose decoded audio stream has no audio track (e.g., silent image/video)
+      // Skip clips whose decoded stream has no audio track
     }
   }
 
   const rendered = await offline.startRendering();
   const ch0 = rendered.getChannelData(0);
   const ch1 = rendered.numberOfChannels > 1 ? rendered.getChannelData(1) : ch0;
-  return encodePcmWav([ch0, ch1], sampleRate, 16);
+  return { channels: [ch0, ch1], sampleRate };
+}
+
+/**
+ * Mixes all active audio clips via OfflineAudioContext and returns a clean WAV Uint8Array.
+ */
+export async function renderProjectMixdownWav(
+  clips: TimelineClip[],
+  tracks: TimelineTrack[],
+  assets: Map<string, MediaAsset>,
+  totalDuration: number,
+  sampleRate = 48000,
+  forceDenoiseAll = false
+): Promise<Uint8Array> {
+  const { channels } = await renderProjectMixdownChannels(
+    clips,
+    tracks,
+    assets,
+    totalDuration,
+    sampleRate,
+    forceDenoiseAll
+  );
+  return encodePcmWav(channels, sampleRate, 16);
 }

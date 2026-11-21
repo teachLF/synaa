@@ -2,8 +2,7 @@
 
 import React, { useMemo, useState } from 'react';
 import { CheckCircle2, Download, Film, Loader2, Sparkles, X } from 'lucide-react';
-import { renderProjectMixdownWav } from '@/lib/audio/noiseSuppressor';
-import { renderCompositionFrame, type MediaElementCache } from '@/lib/editor/canvasRenderer';
+import type { MediaElementCache } from '@/lib/editor/canvasRenderer';
 import {
   getEstimatedBitrateKbps,
   getExportDimensions,
@@ -19,6 +18,7 @@ import type {
   TimelineClip,
   TimelineTrack,
 } from '@/lib/editor/types';
+import { exportProjectInBrowser } from '@/lib/export/clientVideoExporter';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -56,6 +56,9 @@ export default function ExportModal({
   const [errorMsg, setErrorMsg] = useState('');
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [exportedSizeMb, setExportedSizeMb] = useState<string>('');
+  const [exportedDims, setExportedDims] = useState<{ width: number; height: number } | null>(null);
+  const [exportedExt, setExportedExt] = useState<string>('mp4');
+  const [engineUsed, setEngineUsed] = useState<string>('');
 
   const dims = useMemo(() => getExportDimensions(resolution, ratio), [resolution, ratio]);
   const bitrateKbps = useMemo(
@@ -86,123 +89,31 @@ export default function ExportModal({
         includeDenoise,
       };
 
-      // 1. Render audio mixdown WAV (with optional full noise removal)
-      setProgress(10);
-      const audioWav = await renderProjectMixdownWav(
+      const mediaCache = getMediaCache();
+      const result = await exportProjectInBrowser({
+        settings,
         clips,
         tracks,
         assets,
-        safeDuration,
-        48000,
-        includeDenoise
-      );
-      setProgress(22);
-
-      // 2. Render visual frames onto offscreen canvas capped at <= 1920px capture width for ultra-fast GPU/CPU recording
-      const captureScale = dims.width > 1920 ? 1920 / dims.width : 1;
-      const capW = Math.max(320, Math.round((dims.width * captureScale) / 2) * 2);
-      const capH = Math.max(240, Math.round((dims.height * captureScale) / 2) * 2);
-
-      const exportCanvas = document.createElement('canvas');
-      exportCanvas.width = capW;
-      exportCanvas.height = capH;
-      const ctx = exportCanvas.getContext('2d');
-      if (!ctx) throw new Error('تعذر تهيئة محرك الرسم للتصدير');
-
-      const stream = exportCanvas.captureStream(fps);
-      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-        ? 'video/webm;codecs=vp9'
-        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
-        ? 'video/webm;codecs=vp8'
-        : 'video/webm';
-
-      const recorder = new MediaRecorder(stream, {
-        mimeType,
-        videoBitsPerSecond: Math.min(25_000_000, bitrateKbps * 1000),
+        mediaCache,
+        duration: safeDuration,
+        onProgress: (pct) => {
+          setProgress(pct);
+          if (pct >= 80) setStatus('encoding');
+        },
       });
 
-      const chunks: BlobPart[] = [];
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
-      };
-
-      const recordingDone = new Promise<Blob>((resolve) => {
-        recorder.onstop = () => {
-          resolve(new Blob(chunks, { type: mimeType }));
-        };
-      });
-
-      recorder.start(250);
-
-      // Sync video elements and step through timeline smoothly
-      const mediaCache = getMediaCache();
-      const stepMs = 1000 / Math.min(fps, 30);
-      const stepSec = stepMs / 1000;
-      let t = 0;
-
-      // Render frame 0 immediately
-      renderCompositionFrame(ctx, capW, capH, clips, tracks, assets, mediaCache, 0);
-
-      await new Promise<void>((resolve) => {
-        const timer = window.setInterval(() => {
-          t += stepSec;
-          if (t >= safeDuration) {
-            window.clearInterval(timer);
-            resolve();
-            return;
-          }
-          // Seek any active video asset to current timestamp
-          for (const clip of clips) {
-            if (clip.kind === 'video' && clip.assetId && t >= clip.startTime && t <= clip.startTime + clip.duration) {
-              const vid = mediaCache.videos.get(clip.assetId);
-              if (vid) {
-                const targetVidTime = clip.trimStart + (t - clip.startTime) * clip.speed;
-                if (Math.abs(vid.currentTime - targetVidTime) > 0.15) {
-                  vid.currentTime = targetVidTime % Math.max(0.1, vid.duration || 10);
-                }
-              }
-            }
-          }
-          renderCompositionFrame(ctx, capW, capH, clips, tracks, assets, mediaCache, t);
-          setProgress(22 + Math.round((t / safeDuration) * 53));
-        }, stepMs);
-      });
-
-      recorder.stop();
-      const capturedVideoBlob = await recordingDone;
-
-      // 3. Send to server FFmpeg pipeline for ultra-fast 4K scaling + container muxing
-      setStatus('encoding');
-      setProgress(82);
-
-      const formData = new FormData();
-      formData.append('video', capturedVideoBlob, 'capture.webm');
-      formData.append(
-        'audio',
-        new Blob([audioWav.buffer as ArrayBuffer], { type: 'audio/wav' }),
-        'mixdown.wav'
-      );
-      formData.append('settings', JSON.stringify(settings));
-
-      const resp = await fetch('/api/export', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!resp.ok) {
-        const errJson = await resp.json().catch(() => ({}));
-        throw new Error(errJson.error || 'تعذر إتمام الترميز النهائي');
-      }
-
-      const finalBlob = await resp.blob();
-      const url = URL.createObjectURL(finalBlob);
+      const url = URL.createObjectURL(result.blob);
       setDownloadUrl(url);
-      setExportedSizeMb((finalBlob.size / (1024 * 1024)).toFixed(2));
+      setExportedSizeMb((result.blob.size / (1024 * 1024)).toFixed(2));
+      setExportedDims({ width: result.width, height: result.height });
+      setExportedExt(result.actualFormat);
+      setEngineUsed(result.engineLabel);
       setProgress(100);
       setStatus('done');
     } catch (err) {
       setStatus('error');
-      setErrorMsg(err instanceof Error ? err.message : 'حدث خطأ أثناء التصدير');
+      setErrorMsg(err instanceof Error ? err.message : 'حدث خطأ أثناء تصدير الفيديو');
     }
   };
 
@@ -223,7 +134,7 @@ export default function ExportModal({
                 تصدير الفيديو الاحترافي حتى 4K
               </h2>
               <p className="text-xs text-slate-400">
-                معالجة فائقة السرعة مع دعم كامل لجميع الصيغ وعزل الضوضاء
+                معالجة فائقة السرعة مباشرة على جهازك مع دعم كامل لجميع الصيغ وعزل الضوضاء
               </p>
             </div>
           </div>
@@ -284,7 +195,7 @@ export default function ExportModal({
                 <option value="mov">MOV (Apple Pro)</option>
                 <option value="mkv">MKV (Matroska)</option>
                 <option value="webm">WebM (ويب حديث)</option>
-                <option value="avi">AVI (كلاسيكي)</option>
+                <option value="avi">AVI / MP4 متوافق</option>
                 <option value="gif">GIF (صورة متحركة)</option>
               </select>
             </div>
@@ -398,7 +309,7 @@ export default function ExportModal({
                   <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
                   {status === 'rendering'
                     ? 'جاري رسم الإطارات والانتقالات ومعالجة الصوت...'
-                    : 'جاري الترميز النهائي عالي السرعة via FFmpeg...'}
+                    : 'جاري تغليف وتصدير الملف النهائي عالي الدقة...'}
                 </span>
                 <span className="font-mono text-white font-bold">{progress}%</span>
               </div>
@@ -417,16 +328,20 @@ export default function ExportModal({
                 <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" aria-hidden="true" />
                 <div>
                   <div className="text-xs font-bold text-emerald-200">
-                    تم تصدير الفيديو بنجاح بدقة {dims.width}×{dims.height}!
+                    تم تصدير الفيديو بنجاح بدقة{' '}
+                    <span dir="ltr">
+                      {exportedDims ? `${exportedDims.width}×${exportedDims.height}` : `${dims.width}×${dims.height}`}
+                    </span>
                   </div>
                   <div className="text-[11px] font-mono text-emerald-300/80">
-                    الحجم: {exportedSizeMb} MB · الصيغة: {format.toUpperCase()}
+                    الحجم: {exportedSizeMb} MB · الصيغة: {exportedExt.toUpperCase()}
+                    {engineUsed ? ` · ${engineUsed}` : ''}
                   </div>
                 </div>
               </div>
               <a
                 href={downloadUrl}
-                download={`${projectName || 'video'}_${resolution}.${format}`}
+                download={`${projectName || 'video'}_${resolution}.${exportedExt}`}
                 className="inline-flex items-center gap-1.5 px-4 py-2 bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-bold text-xs rounded-md transition-colors whitespace-nowrap"
               >
                 <Download className="w-4 h-4" aria-hidden="true" />

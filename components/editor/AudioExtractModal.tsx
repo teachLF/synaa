@@ -9,7 +9,11 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { renderProjectMixdownWav } from '@/lib/audio/noiseSuppressor';
+import {
+  extractAudioInBrowser,
+  processAudioChannelsWithDenoise,
+} from '@/lib/audio/clientAudioExtractor';
+import { renderProjectMixdownChannels } from '@/lib/audio/noiseSuppressor';
 import { DENOISE_PRESETS } from '@/lib/editor/timelineMath';
 import type {
   AudioExtractFormat,
@@ -60,40 +64,26 @@ export default function AudioExtractModal({
   const [errorMsg, setErrorMsg] = useState('');
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [outputName, setOutputName] = useState('audio_extracted.mp3');
+  const [outputNote, setOutputNote] = useState<string>('');
 
   if (!isOpen) return null;
 
   const handleExtract = async () => {
     setStatus('converting');
     setErrorMsg('');
+    setOutputNote('');
     if (downloadUrl) {
       URL.revokeObjectURL(downloadUrl);
       setDownloadUrl(null);
     }
 
     try {
-      let inputFile: File | null = null;
       let baseName = 'cinestudio_audio';
+      let channels: [Float32Array, Float32Array] | null = null;
+      let inputFile: File | null = null;
 
-      if (sourceMode === 'upload') {
-        if (!uploadedFile) {
-          throw new Error('يرجى اختيار ملف فيديو أو صوت أولاً');
-        }
-        inputFile = uploadedFile;
-        baseName = uploadedFile.name.replace(/\.[^.]+$/, '');
-      } else if (sourceMode === 'asset') {
-        const asset = assets.find((a) => a.id === selectedAssetId);
-        if (!asset) throw new Error('يرجى اختيار ملف من المشروع');
-        baseName = asset.name.replace(/\.[^.]+$/, '');
-        if (asset.rawFile) {
-          inputFile = asset.rawFile;
-        } else {
-          const resp = await fetch(asset.src);
-          const blob = await resp.blob();
-          inputFile = new File([blob], asset.name, { type: asset.mimeType || 'audio/wav' });
-        }
-      } else {
-        const wavBytes = await renderProjectMixdownWav(
+      if (sourceMode === 'timeline') {
+        const mix = await renderProjectMixdownChannels(
           clips,
           tracks,
           assetsMap,
@@ -101,40 +91,103 @@ export default function AudioExtractModal({
           sampleRate,
           denoiseEnabled
         );
-        const wavBlob = new Blob([wavBytes.buffer as ArrayBuffer], { type: 'audio/wav' });
-        inputFile = new File([wavBlob], 'timeline_mixdown.wav', { type: 'audio/wav' });
+        channels = mix.channels;
         baseName = 'timeline_master';
+      } else {
+        let arrayBuffer: ArrayBuffer;
+        if (sourceMode === 'upload') {
+          if (!uploadedFile) {
+            throw new Error('يرجى اختيار ملف فيديو أو صوت أولاً');
+          }
+          inputFile = uploadedFile;
+          baseName = uploadedFile.name.replace(/\.[^.]+$/, '');
+          arrayBuffer = await uploadedFile.arrayBuffer();
+        } else {
+          const asset = assets.find((a) => a.id === selectedAssetId);
+          if (!asset) throw new Error('يرجى اختيار ملف من المشروع');
+          baseName = asset.name.replace(/\.[^.]+$/, '');
+          if (asset.rawFile) {
+            inputFile = asset.rawFile;
+            arrayBuffer = await asset.rawFile.arrayBuffer();
+          } else {
+            const resp = await fetch(asset.src);
+            const blob = await resp.blob();
+            inputFile = new File([blob], asset.name, { type: asset.mimeType || 'audio/wav' });
+            arrayBuffer = await blob.arrayBuffer();
+          }
+        }
+
+        // Decode audio directly in browser
+        const decodeCtx = new AudioContext();
+        try {
+          const decoded = await decodeCtx.decodeAudioData(arrayBuffer.slice(0));
+          const ch0 = decoded.getChannelData(0);
+          const ch1 = decoded.numberOfChannels > 1 ? decoded.getChannelData(1) : ch0;
+          channels = await processAudioChannelsWithDenoise(
+            [ch0, ch1],
+            decoded.sampleRate,
+            sampleRate,
+            denoiseEnabled,
+            denoisePreset
+          );
+        } catch {
+          channels = null;
+        } finally {
+          await decodeCtx.close().catch(() => {});
+        }
       }
 
-      const preset = DENOISE_PRESETS[denoisePreset];
-      const formData = new FormData();
-      formData.append('file', inputFile);
-      formData.append('format', format);
-      formData.append('bitrate', bitrate);
-      formData.append('sampleRate', String(sampleRate));
-      formData.append('denoiseEnabled', String(denoiseEnabled));
-      formData.append('denoiseStrength', String(preset.denoiseStrength));
-      formData.append('windCutHz', String(preset.windCutHz));
-      formData.append('hissCutHz', String(preset.hissCutHz));
-      formData.append('voiceBoost', String(preset.voiceBoost));
-      formData.append('normalize', String(preset.normalize));
-
-      const resp = await fetch('/api/audio/extract', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!resp.ok) {
-        const errData = await resp.json().catch(() => ({}));
-        throw new Error(errData.error || 'تعذر تحويل الملف الصوتي');
+      if (channels) {
+        const res = await extractAudioInBrowser({
+          channels,
+          sampleRate,
+          format,
+          bitrate,
+        });
+        const url = URL.createObjectURL(res.blob);
+        setDownloadUrl(url);
+        setOutputName(`${baseName}.${res.actualExt}`);
+        if (res.note) setOutputNote(res.note);
+        setStatus('done');
+        return;
       }
 
-      const outBlob = await resp.blob();
-      const ext = format === 'aac' ? 'm4a' : format;
-      const url = URL.createObjectURL(outBlob);
-      setDownloadUrl(url);
-      setOutputName(`${baseName}.${ext}`);
-      setStatus('done');
+      // Optional server fallback only if browser couldn't decode an exotic format AND server has FFmpeg
+      if (inputFile) {
+        const preset = DENOISE_PRESETS[denoisePreset];
+        const formData = new FormData();
+        formData.append('file', inputFile);
+        formData.append('format', format);
+        formData.append('bitrate', bitrate);
+        formData.append('sampleRate', String(sampleRate));
+        formData.append('denoiseEnabled', String(denoiseEnabled));
+        formData.append('denoiseStrength', String(preset.denoiseStrength));
+        formData.append('windCutHz', String(preset.windCutHz));
+        formData.append('hissCutHz', String(preset.hissCutHz));
+        formData.append('voiceBoost', String(preset.voiceBoost));
+        formData.append('normalize', String(preset.normalize));
+
+        const resp = await fetch('/api/audio/extract', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!resp.ok) {
+          throw new Error(
+            'صيغة هذا الملف غير مدعومة لفك التشفير الصوتي في المتصفح. جرب ملف MP4 أو WebM أو WAV أو MP3.'
+          );
+        }
+
+        const outBlob = await resp.blob();
+        const ext = format === 'aac' ? 'm4a' : format;
+        const url = URL.createObjectURL(outBlob);
+        setDownloadUrl(url);
+        setOutputName(`${baseName}.${ext}`);
+        setStatus('done');
+        return;
+      }
+
+      throw new Error('تعذر استخراج المسار الصوتي من هذا الملف');
     } catch (err) {
       setStatus('error');
       setErrorMsg(err instanceof Error ? err.message : 'فشلت عملية التحويل');
@@ -155,10 +208,10 @@ export default function AudioExtractModal({
             <FileAudio className="w-5 h-5 text-cyan-400" aria-hidden="true" />
             <div>
               <h2 id="audio-extract-title" className="text-base font-bold text-white">
-                تحويل الفيديو إلى صوت (MP3 · WAV · FLAC)
+                تحويل الفيديو إلى صوت (MP3 · WAV · M4A)
               </h2>
               <p className="text-xs text-slate-400">
-                استخراج فوري وعالي النقاء مع خيار إزالة الضوضاء والهواء
+                استخراج فوري مباشرة على جهازك مع إزالة الضوضاء والهواء
               </p>
             </div>
           </div>
@@ -217,7 +270,7 @@ export default function AudioExtractModal({
               <label className="flex items-center justify-center gap-2 p-4 border border-dashed border-white/20 rounded-lg bg-[#161C27] hover:border-cyan-400/60 cursor-pointer transition-colors">
                 <Upload className="w-4 h-4 text-cyan-400" aria-hidden="true" />
                 <span className="text-xs text-slate-200">
-                  {uploadedFile ? uploadedFile.name : 'اختر أي فيديو (MP4, MOV, MKV, AVI, WebM...)'}
+                  {uploadedFile ? uploadedFile.name : 'اختر أي فيديو (MP4, MOV, MKV, WebM...)'}
                 </span>
                 <input
                   type="file"
@@ -256,8 +309,8 @@ export default function AudioExtractModal({
                   { id: 'mp3', label: 'MP3', desc: 'شامل' },
                   { id: 'wav', label: 'WAV', desc: 'بدون ضغط' },
                   { id: 'aac', label: 'AAC', desc: 'M4A' },
-                  { id: 'flac', label: 'FLAC', desc: 'خسارة 0%' },
-                  { id: 'ogg', label: 'OGG', desc: 'ويب' },
+                  { id: 'flac', label: 'FLAC', desc: 'نقي 100%' },
+                  { id: 'ogg', label: 'OGG', desc: 'Opus' },
                 ] as const
               ).map((fmt) => (
                 <button
@@ -356,12 +409,17 @@ export default function AudioExtractModal({
 
           {/* Status & Download */}
           {status === 'done' && downloadUrl && (
-            <div className="p-3.5 rounded-lg bg-emerald-950/40 border border-emerald-500/40 flex items-center justify-between gap-3">
+            <div className="p-3.5 rounded-lg bg-emerald-950/40 border border-emerald-500/40 flex flex-col sm:flex-row items-center justify-between gap-3">
               <div className="flex items-center gap-2">
                 <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" aria-hidden="true" />
-                <span className="text-xs font-bold text-emerald-200">
-                  جاهز! تم التحويل إلى {format.toUpperCase()} بنجاح
-                </span>
+                <div>
+                  <span className="text-xs font-bold text-emerald-200 block">
+                    جاهز! تم التحويل إلى {outputName.split('.').pop()?.toUpperCase()} بنجاح
+                  </span>
+                  {outputNote && (
+                    <span className="text-[11px] text-emerald-300/80 block">{outputNote}</span>
+                  )}
+                </div>
               </div>
               <a
                 href={downloadUrl}
@@ -369,7 +427,7 @@ export default function AudioExtractModal({
                 className="inline-flex items-center gap-1.5 px-4 py-1.5 bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-bold text-xs rounded-md transition-colors whitespace-nowrap"
               >
                 <Download className="w-4 h-4" aria-hidden="true" />
-                <span>تحميل {format.toUpperCase()}</span>
+                <span>تحميل {outputName.split('.').pop()?.toUpperCase()}</span>
               </a>
             </div>
           )}

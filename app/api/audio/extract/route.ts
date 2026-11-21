@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { resolveFfmpegBinary } from '@/lib/server/ffmpegCheck';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
@@ -21,6 +22,18 @@ const FORMAT_META: Record<string, { ext: string; mime: string; codec: string[] }
 export async function POST(req: NextRequest) {
   let workDir = '';
   try {
+    const ffmpegBin = await resolveFfmpegBinary();
+    if (!ffmpegBin) {
+      return NextResponse.json(
+        {
+          error: 'محرك الخادم غير متاح؛ يتم التحويل مباشرة عبر المتصفح.',
+          code: 'FFMPEG_UNAVAILABLE',
+          fallbackToClient: true,
+        },
+        { status: 501 }
+      );
+    }
+
     const formData = await req.formData();
     const file = formData.get('file');
     const format = String(formData.get('format') || 'mp3').toLowerCase();
@@ -61,7 +74,7 @@ export async function POST(req: NextRequest) {
 
     const filters: string[] = [];
     if (denoiseEnabled) {
-      const nf = -Math.round(18 + (denoiseStrength / 100) * 32); // -18 to -50 dB noise floor
+      const nf = -Math.round(18 + (denoiseStrength / 100) * 32);
       filters.push(`highpass=f=${windCutHz}`);
       filters.push(`lowpass=f=${hissCutHz}`);
       filters.push(`afftdn=nf=${nf}:nt=w`);
@@ -83,7 +96,7 @@ export async function POST(req: NextRequest) {
     }
     args.push(outputPath);
 
-    await execFileAsync('ffmpeg', args);
+    await execFileAsync(ffmpegBin, args);
     const outBuffer = await readFile(outputPath);
 
     return new NextResponse(new Uint8Array(outBuffer), {
@@ -95,8 +108,21 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'تعذر استخراج الصوت من الملف';
-    return NextResponse.json({ error: message }, { status: 500 });
+    const rawMsg = err instanceof Error ? err.message : '';
+    if (rawMsg.includes('ENOENT')) {
+      return NextResponse.json(
+        {
+          error: 'محرك الخادم غير متاح؛ يتم التحويل عبر المتصفح.',
+          code: 'FFMPEG_UNAVAILABLE',
+          fallbackToClient: true,
+        },
+        { status: 501 }
+      );
+    }
+    return NextResponse.json(
+      { error: rawMsg || 'تعذر استخراج الصوت من الملف' },
+      { status: 500 }
+    );
   } finally {
     if (workDir) {
       await rm(workDir, { recursive: true, force: true }).catch(() => {});

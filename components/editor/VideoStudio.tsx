@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion } from 'motion/react';
+import { onAuthStateChanged, type User } from 'firebase/auth';
 import {
   applyAudioCleanupToGraph,
   type LiveAudioNodes,
@@ -29,6 +30,21 @@ import type {
   TimelineTrack,
   TransitionType,
 } from '@/lib/editor/types';
+import {
+  completeEmailLinkSignInIfNeeded,
+  getFirebaseServices,
+  translateFirebaseAuthError,
+} from '@/lib/firebase/client';
+import {
+  deleteCloudProject,
+  loadCloudProjectWithMedia,
+  saveCloudProject,
+  subscribeUserProjects,
+  upsertUserProfile,
+  type CloudProjectSummary,
+} from '@/lib/firebase/projectStore';
+import AuthModal from '../auth/AuthModal';
+import ProjectsDrawer from '../auth/ProjectsDrawer';
 import AudioExtractModal from './AudioExtractModal';
 import ExportModal from './ExportModal';
 import LeftLibraryPanel, { type LibraryTab } from './LeftLibraryPanel';
@@ -52,6 +68,7 @@ function inferMediaKind(file: File): MediaKind {
 }
 
 export default function VideoStudio() {
+  const [projectId, setProjectId] = useState<string>('proj_default_main');
   const [projectName, setProjectName] = useState('مشروع_سينا_4K');
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>('16:9');
   const [tracks, setTracks] = useState<TimelineTrack[]>(INITIAL_TRACKS);
@@ -77,6 +94,16 @@ export default function VideoStudio() {
   const [exportOpen, setExportOpen] = useState(false);
   const [audioExtractOpen, setAudioExtractOpen] = useState(false);
   const [audioExtractAssetId, setAudioExtractAssetId] = useState<string | null>(null);
+
+  // Firebase Auth & Cloud Projects State
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [projectsDrawerOpen, setProjectsDrawerOpen] = useState(false);
+  const [cloudProjects, setCloudProjects] = useState<CloudProjectSummary[]>([]);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [loadingProjectId, setLoadingProjectId] = useState<string | null>(null);
+  const [toastMsg, setToastMsg] = useState<{ text: string; kind: 'info' | 'error' } | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -130,6 +157,13 @@ export default function VideoStudio() {
     [clips]
   );
 
+  const showToast = useCallback((text: string, kind: 'info' | 'error' = 'info') => {
+    setToastMsg({ text, kind });
+    window.setTimeout(() => {
+      setToastMsg((prev) => (prev?.text === text ? null : prev));
+    }, 5000);
+  }, []);
+
   const commitClipsChange = useCallback((updater: (prev: TimelineClip[]) => TimelineClip[]) => {
     setClips((prev) => {
       const next = updater(prev);
@@ -138,6 +172,52 @@ export default function VideoStudio() {
       return next;
     });
   }, []);
+
+  // Initialize Firebase Auth listener & Email Link completion
+  useEffect(() => {
+    let unsubProjects: (() => void) | null = null;
+    const { auth } = getFirebaseServices();
+
+    completeEmailLinkSignInIfNeeded(() =>
+      window.prompt('أدخل بريدك الإلكتروني لإكمال التحقق من الرابط:')
+    )
+      .then((signedInUser) => {
+        if (signedInUser) {
+          showToast('تم التحقق من البريد وتسجيل الدخول بنجاح!', 'info');
+        }
+      })
+      .catch((err) => {
+        showToast(translateFirebaseAuthError(err), 'error');
+      });
+
+    const unsubAuth = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setAuthReady(true);
+
+      if (unsubProjects) {
+        unsubProjects();
+        unsubProjects = null;
+      }
+
+      if (currentUser) {
+        if (currentUser.emailVerified) {
+          upsertUserProfile(currentUser).catch(() => {});
+        }
+        unsubProjects = subscribeUserProjects(
+          currentUser.uid,
+          (list) => setCloudProjects(list),
+          () => {}
+        );
+      } else {
+        setCloudProjects([]);
+      }
+    });
+
+    return () => {
+      unsubAuth();
+      if (unsubProjects) unsubProjects();
+    };
+  }, [showToast]);
 
   // Load demo project on mount asynchronously after hydration
   useEffect(() => {
@@ -193,6 +273,118 @@ export default function VideoStudio() {
       }
     }
   }, [assets]);
+
+  // Save current project & media to Cloud Firestore
+  const handleSaveCurrentProject = useCallback(async () => {
+    if (!user) {
+      setAuthModalOpen(true);
+      return;
+    }
+    if (!user.emailVerified) {
+      showToast('يرجى توثيق بريدك الإلكتروني أولاً من نافذة المشاريع.', 'error');
+      setProjectsDrawerOpen(true);
+      return;
+    }
+
+    setSaveStatus('saving');
+    try {
+      let thumb: string | undefined;
+      if (canvasRef.current) {
+        try {
+          thumb = canvasRef.current.toDataURL('image/jpeg', 0.45);
+        } catch {
+          thumb = undefined;
+        }
+      }
+      const res = await saveCloudProject({
+        user,
+        projectId,
+        name: projectName,
+        aspectRatio,
+        duration: projectDuration,
+        tracks,
+        clips,
+        assets,
+        thumbnail: thumb,
+      });
+      setSaveStatus('saved');
+      if (res.skippedLargeCount > 0) {
+        showToast(
+          `تم حفظ المشروع (${res.savedAssetsCount} ملف وسائط). الملفات الكبيرة جداً محفوظة محلياً على هذا المتصفح.`,
+          'info'
+        );
+      } else {
+        showToast('تم حفظ المشروع وجميع الوسائط في حسابك بنجاح!', 'info');
+      }
+    } catch (err) {
+      setSaveStatus('error');
+      showToast(translateFirebaseAuthError(err), 'error');
+    }
+  }, [user, projectId, projectName, aspectRatio, projectDuration, tracks, clips, assets, showToast]);
+
+  const handleLoadCloudProject = useCallback(
+    async (targetProjectId: string) => {
+      if (!user) return;
+      setLoadingProjectId(targetProjectId);
+      setIsPlaying(false);
+      try {
+        const loaded = await loadCloudProjectWithMedia(user.uid, targetProjectId);
+        mediaCacheRef.current.images.clear();
+        mediaCacheRef.current.videos.clear();
+        audioElementsRef.current.clear();
+
+        setProjectId(loaded.id);
+        setProjectName(loaded.name);
+        setAspectRatio(loaded.aspectRatio);
+        setTracks(loaded.tracks.length > 0 ? loaded.tracks : INITIAL_TRACKS);
+        setAssets(loaded.assets);
+        setClips(loaded.clips);
+        setSelectedClipId(loaded.clips[0]?.id || null);
+        setCurrentTime(0);
+        setHistoryPast([]);
+        setHistoryFuture([]);
+        setSaveStatus('saved');
+        setProjectsDrawerOpen(false);
+        showToast(`تم فتح مشروع «${loaded.name}» بنجاح`, 'info');
+      } catch (err) {
+        showToast(translateFirebaseAuthError(err), 'error');
+      } finally {
+        setLoadingProjectId(null);
+      }
+    },
+    [user, showToast]
+  );
+
+  const handleCreateNewProject = useCallback(() => {
+    const newId = `proj_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    setIsPlaying(false);
+    setProjectId(newId);
+    setProjectName(`مشروع_جديد_${cloudProjects.length + 1}`);
+    setAspectRatio('16:9');
+    setTracks(INITIAL_TRACKS);
+    setAssets([]);
+    setClips([]);
+    setSelectedClipId(null);
+    setCurrentTime(0);
+    setHistoryPast([]);
+    setHistoryFuture([]);
+    setSaveStatus('idle');
+    setProjectsDrawerOpen(false);
+    showToast('تم إنشاء مشروع فارغ جديد', 'info');
+  }, [cloudProjects.length, showToast]);
+
+  const handleDeleteCloudProject = useCallback(
+    async (targetId: string) => {
+      if (!user) return;
+      try {
+        await deleteCloudProject(user.uid, targetId);
+        showToast('تم حذف المشروع من السحابة', 'info');
+      } catch (err) {
+        showToast(translateFirebaseAuthError(err), 'error');
+      }
+    },
+    [user, showToast]
+  );
 
   // Ensure Web Audio API noise-removal graph exists for a media element
   const ensureAudioGraph = useCallback((assetId: string, element: HTMLMediaElement) => {
@@ -290,7 +482,6 @@ export default function VideoStudio() {
       );
       const activeAssetIds = new Set(activeAudioOrVideoClips.map((c) => c.assetId!));
 
-      // Pause inactive elements
       for (const [id, vid] of mediaCacheRef.current.videos.entries()) {
         if (!activeAssetIds.has(id) && !vid.paused) vid.pause();
       }
@@ -353,9 +544,7 @@ export default function VideoStudio() {
 
   // Playback RAF Loop
   useEffect(() => {
-    if (!isPlaying) {
-      return;
-    }
+    if (!isPlaying) return;
 
     let rafId = 0;
     let lastTs = performance.now();
@@ -389,123 +578,127 @@ export default function VideoStudio() {
     }
   }, [clips, tracks, currentTime, isPlaying, syncMediaAndRender]);
 
-  // Import ANY media format (browser-native fast path + FFmpeg transcode fallback)
-  const handleImportFiles = useCallback(async (filesInput: FileList | File[]) => {
-    const fileList = Array.from(filesInput);
-    if (fileList.length === 0) return;
+  // Import ANY media format (browser-native fast path + optional server transcode fallback)
+  const handleImportFiles = useCallback(
+    async (filesInput: FileList | File[]) => {
+      const fileList = Array.from(filesInput);
+      if (fileList.length === 0) return;
 
-    for (const file of fileList) {
-      const kind = inferMediaKind(file);
-      const ext = file.name.split('.').pop()?.toLowerCase() || 'bin';
-      const nativeUrl = URL.createObjectURL(file);
+      for (const file of fileList) {
+        const kind = inferMediaKind(file);
+        const ext = file.name.split('.').pop()?.toLowerCase() || 'bin';
+        const nativeUrl = URL.createObjectURL(file);
 
-      const tryNativeProbe = (): Promise<{
-        ok: boolean;
-        duration: number;
-        width: number;
-        height: number;
-        thumbnail?: string;
-      }> =>
-        new Promise((resolve) => {
-          if (kind === 'image') {
-            const img = new Image();
-            img.onload = () =>
-              resolve({
-                ok: true,
-                duration: 5,
-                width: img.naturalWidth || 1920,
-                height: img.naturalHeight || 1080,
-                thumbnail: nativeUrl,
-              });
-            img.onerror = () => resolve({ ok: false, duration: 5, width: 1920, height: 1080 });
-            img.src = nativeUrl;
-          } else if (kind === 'audio') {
-            const aud = new Audio();
-            aud.onloadedmetadata = () =>
-              resolve({
-                ok: true,
-                duration: Number.isFinite(aud.duration) ? aud.duration : 10,
-                width: 0,
-                height: 0,
-              });
-            aud.onerror = () => resolve({ ok: false, duration: 10, width: 0, height: 0 });
-            aud.src = nativeUrl;
-          } else {
-            const vid = document.createElement('video');
-            vid.preload = 'metadata';
-            vid.onloadedmetadata = () => {
-              resolve({
-                ok: true,
-                duration: Number.isFinite(vid.duration) ? vid.duration : 6,
-                width: vid.videoWidth || 1920,
-                height: vid.videoHeight || 1080,
-              });
-            };
-            vid.onerror = () => resolve({ ok: false, duration: 6, width: 1920, height: 1080 });
-            vid.src = nativeUrl;
+        const tryNativeProbe = (): Promise<{
+          ok: boolean;
+          duration: number;
+          width: number;
+          height: number;
+          thumbnail?: string;
+        }> =>
+          new Promise((resolve) => {
+            if (kind === 'image') {
+              const img = new Image();
+              img.onload = () =>
+                resolve({
+                  ok: true,
+                  duration: 5,
+                  width: img.naturalWidth || 1920,
+                  height: img.naturalHeight || 1080,
+                  thumbnail: nativeUrl,
+                });
+              img.onerror = () => resolve({ ok: false, duration: 5, width: 1920, height: 1080 });
+              img.src = nativeUrl;
+            } else if (kind === 'audio') {
+              const aud = new Audio();
+              aud.onloadedmetadata = () =>
+                resolve({
+                  ok: true,
+                  duration: Number.isFinite(aud.duration) ? aud.duration : 10,
+                  width: 0,
+                  height: 0,
+                });
+              aud.onerror = () => resolve({ ok: false, duration: 10, width: 0, height: 0 });
+              aud.src = nativeUrl;
+            } else {
+              const vid = document.createElement('video');
+              vid.preload = 'metadata';
+              vid.onloadedmetadata = () => {
+                resolve({
+                  ok: true,
+                  duration: Number.isFinite(vid.duration) ? vid.duration : 6,
+                  width: vid.videoWidth || 1920,
+                  height: vid.videoHeight || 1080,
+                });
+              };
+              vid.onerror = () => resolve({ ok: false, duration: 6, width: 1920, height: 1080 });
+              vid.src = nativeUrl;
+            }
+          });
+
+        const probed = await tryNativeProbe();
+        let finalSrc = nativeUrl;
+        let finalDuration = probed.duration;
+        let finalW = probed.width;
+        let finalH = probed.height;
+        let transcodedFrom: string | undefined;
+
+        if (!probed.ok) {
+          setIsTranscoding(true);
+          try {
+            const fd = new FormData();
+            fd.append('file', file);
+            fd.append('kind', kind);
+            const resp = await fetch('/api/media/transcode', { method: 'POST', body: fd });
+            if (resp.ok) {
+              const blob = await resp.blob();
+              URL.revokeObjectURL(nativeUrl);
+              finalSrc = URL.createObjectURL(blob);
+              finalDuration = Number(resp.headers.get('X-Media-Duration')) || 6;
+              finalW = Number(resp.headers.get('X-Media-Width')) || 1920;
+              finalH = Number(resp.headers.get('X-Media-Height')) || 1080;
+              transcodedFrom = ext.toUpperCase();
+            } else {
+              showToast(
+                `صيغة (${ext.toUpperCase()}) غير مدعومة مباشرة في المتصفح الحالي — جرب MP4/WebM/PNG/JPG/MP3/WAV.`,
+                'error'
+              );
+              continue;
+            }
+          } finally {
+            setIsTranscoding(false);
           }
-        });
-
-      const probed = await tryNativeProbe();
-      let finalSrc = nativeUrl;
-      let finalDuration = probed.duration;
-      let finalW = probed.width;
-      let finalH = probed.height;
-      let transcodedFrom: string | undefined;
-
-      if (!probed.ok) {
-        // Use FFmpeg backend transcode so ANY format (MKV, AVI, FLV, HEIC, WMA, etc.) works seamlessly
-        setIsTranscoding(true);
-        try {
-          const fd = new FormData();
-          fd.append('file', file);
-          fd.append('kind', kind);
-          const resp = await fetch('/api/media/transcode', { method: 'POST', body: fd });
-          if (resp.ok) {
-            const blob = await resp.blob();
-            URL.revokeObjectURL(nativeUrl);
-            finalSrc = URL.createObjectURL(blob);
-            finalDuration = Number(resp.headers.get('X-Media-Duration')) || 6;
-            finalW = Number(resp.headers.get('X-Media-Width')) || 1920;
-            finalH = Number(resp.headers.get('X-Media-Height')) || 1080;
-            transcodedFrom = ext.toUpperCase();
-          }
-        } finally {
-          setIsTranscoding(false);
         }
+
+        const newAsset: MediaAsset = {
+          id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          name: file.name,
+          kind,
+          src: finalSrc,
+          originalExt: ext,
+          mimeType: file.type || `${kind}/${ext}`,
+          duration: Math.max(1, Number(finalDuration.toFixed(2))),
+          width: finalW,
+          height: finalH,
+          thumbnail: kind === 'image' ? finalSrc : undefined,
+          waveform:
+            kind === 'audio'
+              ? Array.from({ length: 48 }, (_, i) => 0.25 + Math.abs(Math.sin(i * 0.65)) * 0.7)
+              : undefined,
+          transcodedFrom,
+          rawFile: file,
+        };
+
+        setAssets((prev) => [newAsset, ...prev]);
+        setSaveStatus('idle');
       }
-
-      const newAsset: MediaAsset = {
-        id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        name: file.name,
-        kind,
-        src: finalSrc,
-        originalExt: ext,
-        mimeType: file.type || `${kind}/${ext}`,
-        duration: Math.max(1, Number(finalDuration.toFixed(2))),
-        width: finalW,
-        height: finalH,
-        thumbnail: kind === 'image' ? finalSrc : undefined,
-        waveform:
-          kind === 'audio'
-            ? Array.from({ length: 48 }, (_, i) => 0.25 + Math.abs(Math.sin(i * 0.65)) * 0.7)
-            : undefined,
-        transcodedFrom,
-        rawFile: file,
-      };
-
-      setAssets((prev) => [newAsset, ...prev]);
-    }
-  }, []);
+    },
+    [showToast]
+  );
 
   const handleAddAssetToTimeline = useCallback(
     (asset: MediaAsset) => {
-      const targetTrackId =
-        asset.kind === 'audio'
-          ? 'track-a1'
-          : asset.kind === 'image'
-          ? 'track-v1'
-          : 'track-v1';
+      const targetTrackId = asset.kind === 'audio' ? 'track-a1' : 'track-v1';
 
       const trackClips = clips.filter((c) => c.trackId === targetTrackId);
       const endOfTrack = trackClips.reduce(
@@ -535,6 +728,7 @@ export default function VideoStudio() {
       commitClipsChange((prev) => [...prev, newClip]);
       setSelectedClipId(newClip.id);
       setCurrentTime(newClip.startTime);
+      setSaveStatus('idle');
     },
     [clips, commitClipsChange]
   );
@@ -558,8 +752,8 @@ export default function VideoStudio() {
         })
       );
       setSelectedClipId(targetClip.id);
+      setSaveStatus('idle');
 
-      // Jump playhead right into the transition midpoint so the user sees it instantaneously!
       if (target === 'in') {
         setCurrentTime(targetClip.startTime + dur * 0.48);
       } else {
@@ -612,6 +806,7 @@ export default function VideoStudio() {
       commitClipsChange((prev) => [...prev, newClip]);
       setSelectedClipId(newClip.id);
       setInspectorTab('general');
+      setSaveStatus('idle');
     },
     [currentTime, commitClipsChange]
   );
@@ -660,6 +855,7 @@ export default function VideoStudio() {
       commitClipsChange((prev) => [...prev, newClip]);
       setSelectedClipId(newClip.id);
       setInspectorTab('general');
+      setSaveStatus('idle');
     },
     [currentTime, commitClipsChange]
   );
@@ -679,6 +875,7 @@ export default function VideoStudio() {
         )
       );
       setSelectedClipId(targetClip.id);
+      setSaveStatus('idle');
     },
     [clips, selectedClipId, commitClipsChange]
   );
@@ -686,6 +883,7 @@ export default function VideoStudio() {
   const handleSplitAtPlayhead = useCallback(() => {
     if (!selectedClipId) return;
     commitClipsChange((prev) => splitClipAtTime(prev, selectedClipId, currentTime));
+    setSaveStatus('idle');
   }, [selectedClipId, currentTime, commitClipsChange]);
 
   const handleDuplicateSelected = useCallback(() => {
@@ -699,12 +897,14 @@ export default function VideoStudio() {
     };
     commitClipsChange((prev) => [...prev, copy]);
     setSelectedClipId(copy.id);
+    setSaveStatus('idle');
   }, [clips, selectedClipId, commitClipsChange]);
 
   const handleDeleteClip = useCallback(
     (clipId: string) => {
       commitClipsChange((prev) => prev.filter((c) => c.id !== clipId));
       if (selectedClipId === clipId) setSelectedClipId(null);
+      setSaveStatus('idle');
     },
     [selectedClipId, commitClipsChange]
   );
@@ -770,7 +970,7 @@ export default function VideoStudio() {
       data-testid="video-studio-root"
       data-playing={String(isPlaying)}
       data-clip-count={clips.length}
-      className="h-screen w-screen overflow-hidden bg-[#0A0D12] text-slate-100 flex flex-col"
+      className="h-screen w-screen overflow-hidden bg-[#0A0D12] text-slate-100 flex flex-col relative"
     >
       <input
         ref={fileInputRef}
@@ -788,7 +988,10 @@ export default function VideoStudio() {
 
       <TopToolbar
         projectName={projectName}
-        onProjectNameChange={setProjectName}
+        onProjectNameChange={(name) => {
+          setProjectName(name);
+          setSaveStatus('idle');
+        }}
         aspectRatio={aspectRatio}
         onImportClick={() => fileInputRef.current?.click()}
         onSplitClick={handleSplitAtPlayhead}
@@ -803,7 +1006,26 @@ export default function VideoStudio() {
         }}
         onOpenExport={() => setExportOpen(true)}
         isTranscoding={isTranscoding}
+        user={user}
+        authReady={authReady}
+        saveStatus={saveStatus}
+        onSaveProject={handleSaveCurrentProject}
+        onOpenProjects={() => setProjectsDrawerOpen(true)}
+        onOpenAuth={() => setAuthModalOpen(true)}
       />
+
+      {toastMsg && (
+        <div
+          role="status"
+          className={`fixed bottom-4 left-4 z-50 px-4 py-2.5 rounded-lg border text-xs font-medium shadow-xl max-w-sm ${
+            toastMsg.kind === 'error'
+              ? 'bg-rose-950/90 border-rose-500/50 text-rose-100'
+              : 'bg-[#141B26]/95 border-amber-400/40 text-amber-100'
+          }`}
+        >
+          {toastMsg.text}
+        </div>
+      )}
 
       {/* Middle Workspace: Left Library + Center Monitor + Right Inspector */}
       <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
@@ -842,7 +1064,10 @@ export default function VideoStudio() {
           currentTime={currentTime}
           duration={projectDuration}
           aspectRatio={aspectRatio}
-          onAspectRatioChange={setAspectRatio}
+          onAspectRatioChange={(r) => {
+            setAspectRatio(r);
+            setSaveStatus('idle');
+          }}
           masterMuted={masterMuted}
           onToggleMasterMute={() => setMasterMuted((m) => !m)}
           audioLevel={isPlaying ? audioLevel : 0}
@@ -853,9 +1078,10 @@ export default function VideoStudio() {
           clip={selectedClip}
           activeTab={inspectorTab}
           onTabChange={setInspectorTab}
-          onUpdateClip={(clipId, updater) =>
-            setClips((prev) => prev.map((c) => (c.id === clipId ? updater(c) : c)))
-          }
+          onUpdateClip={(clipId, updater) => {
+            setClips((prev) => prev.map((c) => (c.id === clipId ? updater(c) : c)));
+            setSaveStatus('idle');
+          }}
           onDeleteClip={handleDeleteClip}
           bypassDenoise={bypassDenoise}
           onToggleBypassDenoise={() => setBypassDenoise((b) => !b)}
@@ -876,20 +1102,22 @@ export default function VideoStudio() {
           setIsPlaying(false);
           setCurrentTime(t);
         }}
-        onMoveClip={(clipId, newStart) =>
+        onMoveClip={(clipId, newStart) => {
           setClips((prev) =>
             prev.map((c) => (c.id === clipId ? { ...c, startTime: newStart } : c))
-          )
-        }
-        onTrimClip={(clipId, newStart, newDuration, newTrim) =>
+          );
+          setSaveStatus('idle');
+        }}
+        onTrimClip={(clipId, newStart, newDuration, newTrim) => {
           setClips((prev) =>
             prev.map((c) =>
               c.id === clipId
                 ? { ...c, startTime: newStart, duration: newDuration, trimStart: newTrim }
                 : c
             )
-          )
-        }
+          );
+          setSaveStatus('idle');
+        }}
         onSplitAtPlayhead={handleSplitAtPlayhead}
         onDuplicateSelected={handleDuplicateSelected}
         onDeleteSelected={() => {
@@ -938,6 +1166,31 @@ export default function VideoStudio() {
           tracks={tracks}
           assetsMap={assetsMap}
           projectDuration={projectDuration}
+        />
+      )}
+
+      {authModalOpen && (
+        <AuthModal
+          isOpen={authModalOpen}
+          onClose={() => setAuthModalOpen(false)}
+          onSuccess={() => showToast('تم تسجيل الدخول بنجاح! يمكنك الآن حفظ مشاريعك سحابياً.', 'info')}
+        />
+      )}
+
+      {projectsDrawerOpen && (
+        <ProjectsDrawer
+          isOpen={projectsDrawerOpen}
+          onClose={() => setProjectsDrawerOpen(false)}
+          user={user}
+          projects={cloudProjects}
+          activeProjectId={projectId}
+          isSaving={saveStatus === 'saving'}
+          loadingProjectId={loadingProjectId}
+          onOpenAuth={() => setAuthModalOpen(true)}
+          onSaveCurrent={handleSaveCurrentProject}
+          onCreateNewProject={handleCreateNewProject}
+          onLoadProject={handleLoadCloudProject}
+          onDeleteProject={handleDeleteCloudProject}
         />
       )}
     </motion.main>
